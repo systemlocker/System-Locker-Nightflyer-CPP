@@ -1,0 +1,6 @@
+build/
+out/
+*.user
+
+# The public release repository intentionally contains the reviewed static SDK.
+!static/lib/*.lib
