@@ -42,10 +42,14 @@ namespace syslocker::nightflyer
         std::string systemId;
         std::string baseUrl = "https://systemlocker.net";
         std::string expectedIssuer = "https://systemlocker.net";
-        std::string sdkVersion = "0.1.0";
+        std::string sdkVersion = "0.2.0";
         std::chrono::milliseconds timeout{15000};
         int idempotentTransportRetries = 1;
         std::chrono::milliseconds installationLockTimeout{5000};
+        // Optional stricter policy for deployments that prefer additional
+        // snapshot-replay resistance over offline availability after reboot.
+        // The default still rejects UTC rollback behind the signed high-water
+        // checkpoint.
         bool requireOnlineAfterReboot = false;
         std::shared_ptr<IClock> clock = systemClock();
         std::map<std::string, std::string> trustedSigningKeys;
@@ -196,8 +200,10 @@ namespace syslocker::nightflyer
         Lease verifyCachedLease(const std::string& compact) const;
         Status verifyCachedStatus(const std::string& compact, const std::optional<Lease>& lease) const;
         std::map<std::string, std::string> trustedSigningKeys() const;
-        void restoreTrustedSigningKeys(const std::map<std::string, std::string>& keys);
     private:
+        void restoreTrustedSigningKeyTransitions(const std::vector<std::string>& transitions, std::uint64_t expectedSequence);
+        std::string signPersistentState(std::string_view input) const;
+        bool verifyPersistentState(std::string_view input, const std::string& signature) const;
         struct Impl;
         std::unique_ptr<Impl> impl_;
         friend class AuthorizationSession;

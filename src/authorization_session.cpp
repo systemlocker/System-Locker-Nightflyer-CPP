@@ -136,13 +136,14 @@ namespace syslocker::nightflyer
     {
         struct State
         {
-            int version = 3;
+            int version = 4;
             std::string systemId;
             std::string installationThumbprint;
             std::string keyReference;
             std::string authorizationId;
             std::optional<std::string> storedLicenseKey;
-            std::map<std::string, std::string> keys;
+            std::vector<std::string> keyTransitions;
+            std::optional<std::string> stateSignature;
             std::optional<std::string> leaseCompact;
             std::optional<std::string> statusCompact;
             std::uint64_t statusSequence = 0;
@@ -164,6 +165,7 @@ namespace syslocker::nightflyer
             std::optional<PreparedRequest> pendingEnd;
             std::optional<Lease> lease;
             std::optional<Status> status;
+            bool allowsUnsignedInitialization = false;
         };
 
         Config config;
@@ -180,9 +182,15 @@ namespace syslocker::nightflyer
 
         Impl(Config value, InstallationKey key, std::unique_ptr<IStateStore> stateStore, std::unique_ptr<IInstallationKeyProvider> provider, State initial, std::shared_ptr<IHttpClient> transport)
             : config(std::move(value)), store(std::move(stateStore)), keyProvider(std::move(provider)), http(std::move(transport)),
-              client(clientConfig(config, initial.keys), std::move(key), http), state(std::move(initial)), persistent(store != nullptr),
+              client(config, std::move(key), http), state(std::move(initial)), persistent(store != nullptr),
               processLock("Installation:" + config.systemId + ":" + state.installationThumbprint)
         {
+            if (persistent && !state.allowsUnsignedInitialization)
+            {
+                const auto unsignedState = serializeState(state, false).dump(-1, ' ', false, json::error_handler_t::strict);
+                if (!state.stateSignature || !client.verifyPersistentState(unsignedState, *state.stateSignature))
+                    throw Error(Failure::invalid_state, "Persistent Nightflyer state signature is invalid.");
+            }
             verifyRuntime(state);
             if (!persistent)
             {
@@ -196,21 +204,17 @@ namespace syslocker::nightflyer
             if (lifetimeLock) processLock.release();
         }
 
-        static Config clientConfig(const Config& source, const std::map<std::string, std::string>& keys)
-        {
-            auto result = source; result.trustedSigningKeys = keys; return result;
-        }
-
         static State fresh(const Config& config, const InstallationKey& key, std::string reference)
         {
             State result; result.systemId = config.systemId; result.installationThumbprint = key.thumbprint(); result.keyReference = std::move(reference);
-            result.keys = config.trustedSigningKeys; result.lastKnownGood = config.clock->unixSeconds(); result.wallAtAnchor = result.lastKnownGood;
-            result.anchorMonotonic = config.clock->monotonicMilliseconds(); result.bootIdentifier = config.clock->bootIdentifier(); return result;
+            result.lastKnownGood = config.clock->unixSeconds(); result.wallAtAnchor = result.lastKnownGood;
+            result.anchorMonotonic = config.clock->monotonicMilliseconds(); result.bootIdentifier = config.clock->bootIdentifier(); result.allowsUnsignedInitialization = true; return result;
         }
 
         static void validateLoaded(const Config& config, const State& value)
         {
-            if (value.version != 3 || value.systemId != config.systemId || value.installationThumbprint.empty() || value.keys.empty()
+            if (value.version != 4 || value.systemId != config.systemId || value.installationThumbprint.empty() || value.keyTransitions.size() > 1024
+                || (!value.allowsUnsignedInitialization && (!value.stateSignature || value.stateSignature->empty()))
                 || value.statusSequence > detail::maximumSafeInteger || value.keysetSequence > detail::maximumSafeInteger
                 || value.highestGeneration > detail::maximumSafeInteger || value.minimumGeneration > detail::maximumSafeInteger
                 || value.lastKnownGood < 0 || value.lastKnownGood > detail::maximumUnixTimestamp || value.serverAnchor < 0 || value.serverAnchor > detail::maximumUnixTimestamp
@@ -219,24 +223,38 @@ namespace syslocker::nightflyer
                 || value.authorizationId.size() > 256 || (value.storedLicenseKey && value.storedLicenseKey->size() > 4096)
                 || (value.ended && value.revoked)) throw Error(Failure::invalid_state, "Persistent Nightflyer state is corrupt or belongs to another system.");
             detail::unb64(value.installationThumbprint, 32, Failure::invalid_state);
-            for (const auto& [kid, key] : config.trustedSigningKeys)
-            {
-                const auto found = value.keys.find(kid);
-                if (found == value.keys.end() || !detail::fixedEqual(found->second, key)) throw Error(Failure::invalid_state, "Persistent state no longer contains the application's pinned trust root.");
-            }
+            if (value.stateSignature) detail::unb64(*value.stateSignature, 64, Failure::invalid_state);
+            for (const auto& transition : value.keyTransitions)
+                if (transition.empty() || transition.size() > 65536) throw Error(Failure::invalid_state, "Persistent signing-key transition history is corrupt.");
         }
 
         static State parseState(const std::vector<unsigned char>& bytes, const Config& config)
         {
             if (bytes.empty() || bytes.size() > 1048576) throw Error(Failure::invalid_state, "Persistent Nightflyer state has an invalid size.");
             const auto value = detail::strictJson(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()), Failure::invalid_state, "Persistent Nightflyer state is corrupt.");
-            detail::exact(value, {"version", "system_id", "installation_thumbprint", "key_reference", "authorization_id", "stored_license_key", "keys", "lease", "status", "status_sequence", "keyset_sequence", "highest_generation", "minimum_generation", "last_known_good", "server_anchor", "anchor_monotonic", "wall_at_anchor", "boot_identifier", "retry_failures", "next_retry", "ending", "ended", "revoked", "server_expired", "clock_untrusted", "pending_end"}, "persistent state", Failure::invalid_state);
-            State result; result.version = static_cast<int>(detail::integer(value, "version", Failure::invalid_state)); result.systemId = detail::text(value, "system_id", Failure::invalid_state);
+            const auto version = detail::integer(value, "version", Failure::invalid_state);
+            const std::vector<std::string> commonFields{"version", "system_id", "installation_thumbprint", "key_reference", "authorization_id", "stored_license_key", "lease", "status", "status_sequence", "keyset_sequence", "highest_generation", "minimum_generation", "last_known_good", "server_anchor", "anchor_monotonic", "wall_at_anchor", "boot_identifier", "retry_failures", "next_retry", "ending", "ended", "revoked", "server_expired", "clock_untrusted", "pending_end"};
+            auto expectedFields = commonFields;
+            if (version == 3) expectedFields.emplace_back("keys");
+            else if (version == 4) { expectedFields.emplace_back("key_transitions"); expectedFields.emplace_back("state_signature"); }
+            else throw Error(Failure::invalid_state, "Persistent Nightflyer state version is not supported.");
+            detail::exact(value, expectedFields, "persistent state", Failure::invalid_state);
+
+            State result; result.version = static_cast<int>(version); result.systemId = detail::text(value, "system_id", Failure::invalid_state);
             result.installationThumbprint = detail::text(value, "installation_thumbprint", Failure::invalid_state); result.keyReference = detail::text(value, "key_reference", Failure::invalid_state);
             result.authorizationId = detail::text(value, "authorization_id", Failure::invalid_state);
             if (!value.at("stored_license_key").is_null()) result.storedLicenseKey = detail::text(value, "stored_license_key", Failure::invalid_state);
-            try { result.keys = value.at("keys").get<std::map<std::string, std::string>>(); }
-            catch (const json::exception&) { throw Error(Failure::invalid_state, "Persistent signing keys are corrupt."); }
+            std::map<std::string, std::string> legacyKeys;
+            try
+            {
+                if (version == 3) legacyKeys = value.at("keys").get<std::map<std::string, std::string>>();
+                else
+                {
+                    result.keyTransitions = value.at("key_transitions").get<std::vector<std::string>>();
+                    result.stateSignature = detail::text(value, "state_signature", Failure::invalid_state);
+                }
+            }
+            catch (const json::exception&) { throw Error(Failure::invalid_state, "Persistent signing-key state is corrupt."); }
             if (!value.at("lease").is_null()) result.leaseCompact = detail::text(value, "lease", Failure::invalid_state);
             if (!value.at("status").is_null()) result.statusCompact = detail::text(value, "status", Failure::invalid_state);
             result.statusSequence = detail::safeNonnegative(value, "status_sequence"); result.keysetSequence = detail::safeNonnegative(value, "keyset_sequence");
@@ -247,23 +265,45 @@ namespace syslocker::nightflyer
             for (const auto* field : {"ending", "ended", "revoked", "server_expired", "clock_untrusted"}) if (!value.at(field).is_boolean()) throw Error(Failure::invalid_state, "Persistent terminal state is corrupt.");
             result.ending = value.at("ending").get<bool>(); result.ended = value.at("ended").get<bool>(); result.revoked = value.at("revoked").get<bool>(); result.serverExpired = value.at("server_expired").get<bool>(); result.clockUntrusted = value.at("clock_untrusted").get<bool>();
             if (!value.at("pending_end").is_null()) result.pendingEnd = parsePrepared(value.at("pending_end"));
+
+            if (version == 3)
+            {
+                for (const auto& [kid, key] : config.trustedSigningKeys)
+                {
+                    const auto found = legacyKeys.find(kid);
+                    if (found == legacyKeys.end() || !detail::fixedEqual(found->second, key)) throw Error(Failure::invalid_state, "Legacy state no longer contains the application's pinned trust root.");
+                }
+
+                // Version 3 stored a derived key ring without proof of how its
+                // keys were authorized. Preserve only installation identity and
+                // the user's credential; online authorization rebuilds all
+                // security-sensitive state under the authenticated v4 format.
+                result.version = 4; result.authorizationId.clear(); result.keyTransitions.clear(); result.leaseCompact.reset(); result.statusCompact.reset();
+                result.statusSequence = 0; result.keysetSequence = 0; result.highestGeneration = 0; result.minimumGeneration = 0;
+                result.lastKnownGood = config.clock->unixSeconds(); result.serverAnchor = 0; result.anchorMonotonic = config.clock->monotonicMilliseconds();
+                result.wallAtAnchor = result.lastKnownGood; result.bootIdentifier = config.clock->bootIdentifier(); result.retryFailures = 0; result.nextRetry = 0;
+                result.ending = false; result.ended = false; result.revoked = false; result.serverExpired = false; result.clockUntrusted = false; result.pendingEnd.reset();
+                result.stateSignature.reset(); result.allowsUnsignedInitialization = true;
+            }
             validateLoaded(config, result); return result;
         }
 
-        json serialize() const
+        static json serializeState(const State& state, bool includeSignature)
         {
-            json value{{"version", state.version}, {"system_id", state.systemId}, {"installation_thumbprint", state.installationThumbprint}, {"key_reference", state.keyReference}, {"authorization_id", state.authorizationId}, {"keys", state.keys},
+            json value{{"version", state.version}, {"system_id", state.systemId}, {"installation_thumbprint", state.installationThumbprint}, {"key_reference", state.keyReference}, {"authorization_id", state.authorizationId}, {"key_transitions", state.keyTransitions},
                 {"status_sequence", state.statusSequence}, {"keyset_sequence", state.keysetSequence}, {"highest_generation", state.highestGeneration}, {"minimum_generation", state.minimumGeneration},
                 {"last_known_good", state.lastKnownGood}, {"server_anchor", state.serverAnchor}, {"anchor_monotonic", state.anchorMonotonic}, {"wall_at_anchor", state.wallAtAnchor}, {"boot_identifier", state.bootIdentifier},
                 {"retry_failures", state.retryFailures}, {"next_retry", state.nextRetry}, {"ending", state.ending}, {"ended", state.ended}, {"revoked", state.revoked}, {"server_expired", state.serverExpired}, {"clock_untrusted", state.clockUntrusted}};
             value["stored_license_key"] = state.storedLicenseKey ? json(*state.storedLicenseKey) : json(nullptr);
             value["lease"] = state.leaseCompact ? json(*state.leaseCompact) : json(nullptr); value["status"] = state.statusCompact ? json(*state.statusCompact) : json(nullptr);
-            value["pending_end"] = state.pendingEnd ? preparedJson(*state.pendingEnd) : json(nullptr); return value;
+            value["pending_end"] = state.pendingEnd ? preparedJson(*state.pendingEnd) : json(nullptr);
+            if (includeSignature) value["state_signature"] = state.stateSignature ? json(*state.stateSignature) : json(nullptr);
+            return value;
         }
 
         void verifyRuntime(State& value)
         {
-            client.restoreTrustedSigningKeys(value.keys);
+            client.restoreTrustedSigningKeyTransitions(value.keyTransitions, value.keysetSequence);
             value.lease = value.leaseCompact ? std::optional<Lease>(client.verifyCachedLease(*value.leaseCompact)) : std::nullopt;
             value.status = value.statusCompact ? std::optional<Status>(client.verifyCachedStatus(*value.statusCompact, value.lease)) : std::nullopt;
             if (value.lease && (value.lease->generation != value.highestGeneration || value.lease->generation < value.minimumGeneration)) throw Error(Failure::invalid_state, "Persistent lease conflicts with generation high-water marks.");
@@ -279,9 +319,14 @@ namespace syslocker::nightflyer
             auto bytes = store->load(); if (!bytes) throw Error(Failure::invalid_state, "Shared Nightflyer state disappeared.");
             auto loaded = parseState(*bytes, config);
             if (!detail::fixedEqual(loaded.installationThumbprint, state.installationThumbprint) || !detail::fixedEqual(loaded.keyReference, state.keyReference)) throw Error(Failure::invalid_state, "Shared state belongs to another installation key.");
-            const auto previousKeys = client.trustedSigningKeys();
+            if (!loaded.allowsUnsignedInitialization)
+            {
+                const auto unsignedState = serializeState(loaded, false).dump(-1, ' ', false, json::error_handler_t::strict);
+                if (!loaded.stateSignature || !client.verifyPersistentState(unsignedState, *loaded.stateSignature)) throw Error(Failure::invalid_state, "Persistent Nightflyer state signature is invalid.");
+            }
+            const auto previousTransitions = state.keyTransitions; const auto previousSequence = state.keysetSequence;
             try { verifyRuntime(loaded); state = std::move(loaded); }
-            catch (...) { client.restoreTrustedSigningKeys(previousKeys); throw; }
+            catch (...) { client.restoreTrustedSigningKeyTransitions(previousTransitions, previousSequence); throw; }
         }
 
         std::optional<std::int64_t> anchoredTime() const
@@ -335,7 +380,10 @@ namespace syslocker::nightflyer
         {
             if (!persistent) return;
             state.lastKnownGood = std::max(state.lastKnownGood, effectiveNow());
-            const auto text = serialize().dump(-1, ' ', false, json::error_handler_t::strict);
+            const auto unsignedState = serializeState(state, false).dump(-1, ' ', false, json::error_handler_t::strict);
+            state.stateSignature = client.signPersistentState(unsignedState);
+            state.allowsUnsignedInitialization = false;
+            const auto text = serializeState(state, true).dump(-1, ' ', false, json::error_handler_t::strict);
             store->save(std::vector<unsigned char>(text.begin(), text.end()));
         }
 
@@ -365,7 +413,21 @@ namespace syslocker::nightflyer
             if (response.keysetSequence < state.keysetSequence || (response.status && response.status->sequence < state.statusSequence)) throw Error(Failure::invalid_state, "Server sequence moved backwards; local state may have been rolled back.");
             if (!freshAuthorization && response.lease && response.lease->generation < state.highestGeneration) throw Error(Failure::invalid_state, "Lease generation moved backwards.");
             if (response.decision && response.decision->responseCode == "STALE_GENERATION") { reload(); return; }
-            state.keysetSequence = response.keysetSequence; state.keys = client.trustedSigningKeys();
+            auto acceptedTransitions = state.keyTransitions;
+            acceptedTransitions.insert(acceptedTransitions.end(), response.keyTransitions.begin(), response.keyTransitions.end());
+            try
+            {
+                // Rebuild from the application's immutable trust roots. This
+                // proves the persisted derivation path instead of trusting the
+                // mutable key ring that happened to verify this response.
+                client.restoreTrustedSigningKeyTransitions(acceptedTransitions, response.keysetSequence);
+            }
+            catch (...)
+            {
+                client.restoreTrustedSigningKeyTransitions(state.keyTransitions, state.keysetSequence);
+                throw;
+            }
+            state.keyTransitions = std::move(acceptedTransitions); state.keysetSequence = response.keysetSequence;
             if (response.lease)
             {
                 if (freshAuthorization)
@@ -520,8 +582,10 @@ namespace syslocker::nightflyer
         ProcessFileLock bootstrap("Bootstrap:" + config.systemId + ":" + store->lockIdentity());
         if (!bootstrap.acquire(config.installationLockTimeout)) throw Error(Failure::invalid_state, "Another process is opening this Nightflyer state.");
         struct Release { ProcessFileLock& lock; ~Release() { lock.release(); } } release{bootstrap};
-        auto bytes = store->load(); Impl::State state; InstallationKeyHandle handle = bytes ? provider->load(config.systemId, Impl::parseState(*bytes, config).keyReference) : provider->create(config.systemId);
-        state = bytes ? Impl::parseState(*bytes, config) : Impl::fresh(config, handle.key, handle.reference);
+        auto bytes = store->load();
+        Impl::State state = bytes ? Impl::parseState(*bytes, config) : Impl::State{};
+        InstallationKeyHandle handle = bytes ? provider->load(config.systemId, state.keyReference) : provider->create(config.systemId);
+        if (!bytes) state = Impl::fresh(config, handle.key, handle.reference);
         if (!detail::fixedEqual(handle.key.thumbprint(), state.installationThumbprint)) throw Error(Failure::invalid_state, "Persistent state belongs to another installation key.");
         auto result = AuthorizationSession(std::make_unique<Impl>(config, std::move(handle.key), std::move(store), std::move(provider), std::move(state), std::move(http)));
         result.impl_->persist(); return result;

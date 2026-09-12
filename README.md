@@ -55,7 +55,7 @@ link those dependencies through your build system.
 ## Prebuilt Windows static SDK
 
 The repository includes a self-contained Windows x64 SDK under `static/` and
-as `systemlocker-nightflyer-sdk-0.1.0-win64-static.zip`. It contains the public
+as `systemlocker-nightflyer-sdk-0.2.0-win64-static.zip`. It contains the public
 header, Nightflyer library, static libcurl/OpenSSL/zlib dependencies, and their
 license texts. See [STATIC-LIBRARY.md](STATIC-LIBRARY.md) for Visual Studio
 link settings and the complete package contract.
@@ -106,9 +106,10 @@ else if (result.shouldPromptForKey)
 ```
 
 For persistent Windows leases, use AuthorizationSession::persistent with a
-Windows DPAPI state store. The protected record atomically stores the
-installation key, lease, retained license key, time checkpoint, signing-key
-transitions, and status/generation high-water marks. The retained key lets an
+Windows DPAPI state store. State is protected with per-user DPAPI, atomically
+replaced, and signed by the separately stored, non-exportable CNG installation
+key. The record contains the lease, retained license key, time checkpoint,
+authenticated signing-key transitions, and status/generation high-water marks. The retained key lets an
 inactive installation request a fresh lease without asking the user to type it
 again. Nightflyer erases it only after the server returns the definitive
 `KEY_NOT_FOUND` result. On macOS or Linux, provide an IStateStore
@@ -151,20 +152,29 @@ traveling. During the same OS boot, lease time advances from verified server
 UTC using an elapsed-time clock that includes sleep. Time-zone changes and
 wall-clock corrections do not shorten or extend the signed lease lifetime.
 
-After a reboot, the default policy permits offline use when UTC is consistent
-with the protected time checkpoint and the lease has not expired. A clock
-rollback that cannot be verified requires an online check; set
-`requireOnlineAfterReboot` to require one after every reboot instead. A
-successful signed online response repairs a bad local time checkpoint but
-does not extend an existing lease's signed expiry. If the OS cannot provide a
-boot identifier, reopening the application uses the same conservative UTC
-checks as a reboot.
+After a reboot, a persisted lease remains usable by default when UTC is
+consistent with the installation-key-signed high-water checkpoint. This keeps
+normal restarts and time-zone changes offline while rejecting a simple clock
+rollback. Set `requireOnlineAfterReboot = true` when a deployment prefers the
+stronger policy of requiring one signed online response after every OS boot.
+Software-only storage cannot detect every coordinated rollback of both an old
+signed state snapshot and the OS clock. A successful signed online response
+repairs a bad local time checkpoint but does not extend an existing lease's
+signed expiry. Memory-only sessions are not persisted across application or OS
+restarts.
 
 ## Security addendum
 
-Pinned server keys are a developer-provided trust root. The session accepts a
-new key only through a signed transition from a previously trusted key, persists
-the key/status/generation high-water marks, and rejects revoked keys, devices,
+> [!WARNING]
+> Watch this repository (Watch → Custom → Releases) and update your
+> dependency when a release ships: releases regularly add security
+> enhancements.
+
+Pinned server keys are a developer-provided trust root. The session persists
+the signed transition chain rather than a derived key-ring snapshot, then
+replays it from those roots on every open. Version 3 state is migrated by
+retaining only the installation identity and stored license credential; cached
+authorization is reacquired online. The session rejects revoked keys, devices,
 grants, rollback, and stale leases. It uses the signed server-time anchor plus a
 suspend-aware monotonic clock within a boot. Nightflyer cannot immediately
 revoke a device that is offline, and even though it increases resilience to

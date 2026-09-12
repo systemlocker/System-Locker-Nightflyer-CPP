@@ -19,6 +19,7 @@ namespace syslocker::nightflyer
         virtual ~Impl() = default;
         virtual std::array<unsigned char, 64> publicCoordinates() const = 0;
         virtual std::array<unsigned char, 64> signSha256(std::string_view input) const = 0;
+        virtual bool verifySha256(std::string_view input, const std::array<unsigned char, 64>& signature) const = 0;
         virtual std::string exportPem() const = 0;
     };
 

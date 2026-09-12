@@ -158,6 +158,38 @@ namespace syslocker::nightflyer
                 return result;
             }
 
+            bool verifySha256(std::string_view input, const std::array<unsigned char, 64>& raw) const override
+            {
+                ECDSA_SIG* signature = ECDSA_SIG_new();
+                BIGNUM* r = BN_bin2bn(raw.data(), 32, nullptr);
+                BIGNUM* s = BN_bin2bn(raw.data() + 32, 32, nullptr);
+                if (!signature || !r || !s || ECDSA_SIG_set0(signature, r, s) != 1)
+                {
+                    ECDSA_SIG_free(signature); BN_free(r); BN_free(s);
+                    throw Error(Failure::local_failure, "Installation state signature setup failed.");
+                }
+                const auto derLength = i2d_ECDSA_SIG(signature, nullptr);
+                std::vector<unsigned char> der(static_cast<std::size_t>(std::max(0, derLength)));
+                auto* cursor = der.data();
+                if (derLength <= 0 || i2d_ECDSA_SIG(signature, &cursor) != derLength)
+                {
+                    ECDSA_SIG_free(signature);
+                    throw Error(Failure::local_failure, "Installation state signature encoding failed.");
+                }
+                ECDSA_SIG_free(signature);
+
+                EVP_MD_CTX* context = EVP_MD_CTX_new();
+                if (!context || EVP_DigestVerifyInit(context, nullptr, EVP_sha256(), nullptr, key_) != 1)
+                {
+                    EVP_MD_CTX_free(context);
+                    throw Error(Failure::local_failure, "Installation state signature verification failed.");
+                }
+                const auto verified = EVP_DigestVerify(context, der.data(), der.size(), reinterpret_cast<const unsigned char*>(input.data()), input.size());
+                EVP_MD_CTX_free(context);
+                if (verified < 0) throw Error(Failure::local_failure, "Installation state signature verification failed.");
+                return verified == 1;
+            }
+
             std::string exportPem() const override
             {
                 BIO* output = BIO_new(BIO_s_mem());
@@ -654,19 +686,38 @@ namespace syslocker::nightflyer
     {
         std::map<std::string, std::string> result; for (const auto& [kid, key] : impl_->keys) result.emplace(kid, detail::b64(key)); return result;
     }
-    void Client::restoreTrustedSigningKeys(const std::map<std::string, std::string>& values)
+    void Client::restoreTrustedSigningKeyTransitions(const std::vector<std::string>& transitions, std::uint64_t expectedSequence)
     {
         std::map<std::string, std::vector<unsigned char>> decoded;
-        for (const auto& [kid, value] : values)
-        {
-            if (!detail::isKid(kid)) throw Error(Failure::invalid_state, "Saved signing key ID is invalid.");
-            decoded.emplace(kid, detail::unb64(value, 32, Failure::invalid_state));
-        }
         for (const auto& [kid, value] : impl_->config.trustedSigningKeys)
         {
-            const auto found = values.find(kid);
-            if (found == values.end() || !detail::fixedEqual(found->second, value)) throw Error(Failure::invalid_state, "Saved state no longer contains the application's pinned trust root.");
+            if (!detail::isKid(kid)) throw Error(Failure::invalid_state, "Configured signing key ID is invalid.");
+            decoded.emplace(kid, detail::unb64(value, 32, Failure::invalid_state));
         }
+
+        std::uint64_t sequence = 0;
+        try
+        {
+            for (const auto& compact : transitions) sequence = impl_->transition(compact, sequence, decoded);
+        }
+        catch (const Error& error)
+        {
+            if (error.failure() != Failure::invalid_token && error.failure() != Failure::invalid_signature) throw;
+            throw Error(Failure::invalid_state, "Persistent signing-key transition history is not authentic.");
+        }
+        if (sequence != expectedSequence) throw Error(Failure::invalid_state, "Persistent signing-key transition history does not match its high-water mark.");
         impl_->keys = std::move(decoded);
+    }
+    std::string Client::signPersistentState(std::string_view input) const
+    {
+        const auto signature = impl_->key.impl_->signSha256(input);
+        return detail::b64(signature.data(), signature.size());
+    }
+    bool Client::verifyPersistentState(std::string_view input, const std::string& encoded) const
+    {
+        const auto decoded = detail::unb64(encoded, 64, Failure::invalid_state);
+        std::array<unsigned char, 64> signature{};
+        std::copy(decoded.begin(), decoded.end(), signature.begin());
+        return impl_->key.impl_->verifySha256(input, signature);
     }
 }

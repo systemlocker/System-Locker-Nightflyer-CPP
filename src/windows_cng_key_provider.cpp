@@ -88,6 +88,36 @@ namespace syslocker::nightflyer
                 return signature;
             }
 
+            bool verifySha256(std::string_view input, const std::array<unsigned char, 64>& signature) const override
+            {
+                std::array<unsigned char, 32> hash{};
+                BCRYPT_ALG_HANDLE algorithm = nullptr;
+                BCRYPT_HASH_HANDLE hashing = nullptr;
+                DWORD objectLength = 0, returned = 0;
+                if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0
+                    || BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &returned, 0) != 0)
+                {
+                    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+                    throw Error(Failure::local_failure, "SHA-256 setup failed for CNG state verification.");
+                }
+                std::vector<unsigned char> object(objectLength);
+                if (BCryptCreateHash(algorithm, &hashing, object.data(), objectLength, nullptr, 0, 0) != 0
+                    || BCryptHashData(hashing, reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())), static_cast<ULONG>(input.size()), 0) != 0
+                    || BCryptFinishHash(hashing, hash.data(), static_cast<ULONG>(hash.size()), 0) != 0)
+                {
+                    if (hashing) BCryptDestroyHash(hashing);
+                    BCryptCloseAlgorithmProvider(algorithm, 0);
+                    throw Error(Failure::local_failure, "SHA-256 failed for CNG state verification.");
+                }
+                BCryptDestroyHash(hashing); BCryptCloseAlgorithmProvider(algorithm, 0);
+                const auto result = NCryptVerifySignature(key_, nullptr, hash.data(), static_cast<DWORD>(hash.size()),
+                    const_cast<unsigned char*>(signature.data()), static_cast<DWORD>(signature.size()), 0);
+                SecureZeroMemory(hash.data(), hash.size());
+                if (result == ERROR_SUCCESS) return true;
+                if (result == NTE_BAD_SIGNATURE) return false;
+                throw Error(Failure::local_failure, "CNG installation state signature verification failed.");
+            }
+
             std::string exportPem() const override { throw Error(Failure::local_failure, "Non-exportable CNG installation keys cannot be serialized."); }
         private:
             NCRYPT_KEY_HANDLE key_;

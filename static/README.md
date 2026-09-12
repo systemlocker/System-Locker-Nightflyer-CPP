@@ -7,7 +7,7 @@ copies of libcurl, OpenSSL Crypto, and zlib. It does not require Nightflyer,
 curl, OpenSSL, or zlib DLLs at runtime.
 
 The current release archive is named
-`systemlocker-nightflyer-sdk-0.1.0-win64-static.zip` and is also available as
+`systemlocker-nightflyer-sdk-0.2.0-win64-static.zip` and is also available as
 the `static/` directory in this repository.
 
 ## Visual Studio integration
