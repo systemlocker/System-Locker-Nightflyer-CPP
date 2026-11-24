@@ -73,7 +73,7 @@ namespace syslocker::nightflyer
                 curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
                 curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_.count()));
                 curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_.count()));
-                curl_easy_setopt(curl, CURLOPT_USERAGENT, "systemlocker-nightflyer-cpp/0.2.0");
+                curl_easy_setopt(curl, CURLOPT_USERAGENT, "systemlocker-nightflyer-cpp/0.3.0");
 
                 const auto result = curl_easy_perform(curl);
                 if (result != CURLE_OK) response.error = curl_easy_strerror(result);

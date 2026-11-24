@@ -55,7 +55,7 @@ link those dependencies through your build system.
 ## Prebuilt Windows static SDK
 
 The repository includes a self-contained Windows x64 SDK under `static/` and
-as `systemlocker-nightflyer-sdk-0.2.0-win64-static.zip`. It contains the public
+as `systemlocker-nightflyer-sdk-0.3.0-win64-static.zip`. It contains the public
 header, Nightflyer library, static libcurl/OpenSSL/zlib dependencies, and their
 license texts. See [STATIC-LIBRARY.md](STATIC-LIBRARY.md) for Visual Studio
 link settings and the complete package contract.

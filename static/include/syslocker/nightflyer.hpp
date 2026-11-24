@@ -42,7 +42,7 @@ namespace syslocker::nightflyer
         std::string systemId;
         std::string baseUrl = "https://systemlocker.net";
         std::string expectedIssuer = "https://systemlocker.net";
-        std::string sdkVersion = "0.2.0";
+        std::string sdkVersion = "0.3.0";
         std::chrono::milliseconds timeout{15000};
         int idempotentTransportRetries = 1;
         std::chrono::milliseconds installationLockTimeout{5000};
